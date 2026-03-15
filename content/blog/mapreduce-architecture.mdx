@@ -1,0 +1,300 @@
+---
+title: "MapReduce: Distributed Data Processing from Scratch"
+description: "How MapReduce distributes large-scale data processing across a cluster — covering the programming model, task scheduling, fault recovery, and what I learned building a simplified framework in Go."
+date: "2026-03-15"
+tags: ["Distributed Systems", "MapReduce", "Go", "Architecture"]
+---
+
+MapReduce is one of the most influential papers in distributed systems. Published by Google in 2004, it described a programming model that let engineers write simple sequential code and have the infrastructure automatically parallelize it across thousands of machines.
+
+Understanding MapReduce is foundational — not because you'll use it directly (Spark largely replaced it), but because the patterns it introduced — task decomposition, worker coordination, fault recovery, data locality — appear in nearly every distributed data system built since.
+
+## The Programming Model
+
+The core idea is elegant: express your computation as two functions.
+
+```go
+// Map takes a key-value pair and emits intermediate key-value pairs
+type MapFunc func(key, value string) []KeyValue
+
+// Reduce takes a key and all values for that key, emits a result
+type ReduceFunc func(key string, values []string) string
+
+type KeyValue struct {
+    Key   string
+    Value string
+}
+```
+
+**Word count** is the canonical example:
+
+```go
+func mapFn(filename, content string) []KeyValue {
+    words := strings.Fields(content)
+    kvs := make([]KeyValue, 0, len(words))
+    for _, w := range words {
+        kvs = append(kvs, KeyValue{Key: w, Value: "1"})
+    }
+    return kvs
+}
+
+func reduceFn(key string, values []string) string {
+    return strconv.Itoa(len(values))
+}
+```
+
+The framework handles everything else: splitting input, distributing work, shuffling intermediate data, and aggregating results.
+
+## Architecture Overview
+
+A MapReduce job has two roles: a **Coordinator** (called Master in the original paper) and **Workers**.
+
+```
+Input Files
+    │
+    ▼
+┌─────────────┐
+│ Coordinator │  ← tracks task state, assigns work
+└─────────────┘
+       │
+  ┌────┴────┐
+  ▼         ▼
+Worker    Worker    ...
+  │         │
+Map Task  Map Task
+  │         │
+  ▼         ▼
+Intermediate Files (R buckets each)
+       │
+  ┌────┴────┐
+  ▼         ▼
+Worker    Worker
+  │         │
+Reduce    Reduce
+Task      Task
+  │         │
+  ▼         ▼
+Output File 0  Output File 1
+```
+
+The coordinator divides the input into **M map tasks** and **R reduce tasks**. Each map task processes one input split. Each reduce task collects one partition of the intermediate keys from all mappers.
+
+## Coordinator Design
+
+The coordinator is a state machine over tasks. Each task is in one of three states:
+
+```go
+type TaskState int
+
+const (
+    Idle       TaskState = iota
+    InProgress
+    Completed
+)
+
+type Task struct {
+    ID        int
+    Type      TaskType  // Map or Reduce
+    State     TaskState
+    StartTime time.Time
+    InputFile string    // for map tasks
+    NReduce   int       // number of reduce buckets
+    NMap      int       // number of map tasks (for reduce tasks)
+}
+
+type Coordinator struct {
+    mu          sync.Mutex
+    mapTasks    []Task
+    reduceTasks []Task
+    phase       Phase  // MapPhase or ReducePhase
+    done        bool
+}
+```
+
+Workers request tasks via RPC. The coordinator assigns an idle task:
+
+```go
+func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    if c.phase == MapPhase {
+        for i := range c.mapTasks {
+            t := &c.mapTasks[i]
+            if t.State == Idle {
+                t.State = InProgress
+                t.StartTime = time.Now()
+                reply.Task = *t
+                return nil
+            }
+        }
+    }
+
+    if c.allMapsDone() && c.phase == MapPhase {
+        c.phase = ReducePhase
+    }
+
+    // ... assign reduce tasks similarly
+
+    reply.Task = Task{Type: WaitTask}
+    return nil
+}
+```
+
+## Fault Recovery
+
+Worker crashes are the norm, not the exception. The coordinator detects failures by checking task age:
+
+```go
+// Called periodically to re-queue tasks assigned to crashed workers
+func (c *Coordinator) requeue() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    timeout := 10 * time.Second
+
+    for i := range c.mapTasks {
+        t := &c.mapTasks[i]
+        if t.State == InProgress && time.Since(t.StartTime) > timeout {
+            t.State = Idle
+            t.StartTime = time.Time{}
+        }
+    }
+
+    for i := range c.reduceTasks {
+        t := &c.reduceTasks[i]
+        if t.State == InProgress && time.Since(t.StartTime) > timeout {
+            t.State = Idle
+        }
+    }
+}
+```
+
+This is the key correctness property: **idempotent task execution**. A map task that runs twice produces the same intermediate files. The coordinator ignores late completions from workers that were assumed dead.
+
+## The Shuffle Phase
+
+The shuffle — moving intermediate data from mappers to reducers — is where performance lives.
+
+Each mapper writes its output to R local files, one per reduce bucket:
+
+```go
+func writeIntermediateFiles(taskID, nReduce int, kvs []KeyValue) error {
+    // Create temporary files to avoid partial writes being visible
+    encoders := make([]*json.Encoder, nReduce)
+    files := make([]*os.File, nReduce)
+
+    for r := 0; r < nReduce; r++ {
+        tmpFile, err := os.CreateTemp("", "mr-tmp-*")
+        if err != nil {
+            return err
+        }
+        files[r] = tmpFile
+        encoders[r] = json.NewEncoder(tmpFile)
+    }
+
+    for _, kv := range kvs {
+        bucket := ihash(kv.Key) % nReduce
+        if err := encoders[bucket].Encode(kv); err != nil {
+            return err
+        }
+    }
+
+    // Atomically rename temp files to final names
+    for r, f := range files {
+        f.Close()
+        finalName := fmt.Sprintf("mr-%d-%d", taskID, r)
+        os.Rename(f.Name(), finalName)
+    }
+    return nil
+}
+
+func ihash(key string) int {
+    h := fnv.New32a()
+    h.Write([]byte(key))
+    return int(h.Sum32() & 0x7fffffff)
+}
+```
+
+Atomic rename is important: a reduce worker reading `mr-0-1` should see either a complete file or nothing — never a partial write.
+
+The reducer collects all `mr-*-R` files (one from each mapper), sorts by key, then calls the reduce function for each unique key:
+
+```go
+func runReduce(task Task, reduceFn ReduceFunc) error {
+    var allKVs []KeyValue
+
+    for m := 0; m < task.NMap; m++ {
+        filename := fmt.Sprintf("mr-%d-%d", m, task.ID)
+        f, err := os.Open(filename)
+        if err != nil {
+            return err
+        }
+        dec := json.NewDecoder(f)
+        for {
+            var kv KeyValue
+            if err := dec.Decode(&kv); err != nil {
+                break
+            }
+            allKVs = append(allKVs, kv)
+        }
+        f.Close()
+    }
+
+    sort.Slice(allKVs, func(i, j int) bool {
+        return allKVs[i].Key < allKVs[j].Key
+    })
+
+    outFile, _ := os.CreateTemp("", "mr-out-*")
+    enc := json.NewEncoder(outFile)
+
+    i := 0
+    for i < len(allKVs) {
+        j := i + 1
+        for j < len(allKVs) && allKVs[j].Key == allKVs[i].Key {
+            j++
+        }
+        values := make([]string, j-i)
+        for k := i; k < j; k++ {
+            values[k-i] = allKVs[k].Value
+        }
+        output := reduceFn(allKVs[i].Key, values)
+        enc.Encode(KeyValue{Key: allKVs[i].Key, Value: output})
+        i = j
+    }
+
+    outFile.Close()
+    os.Rename(outFile.Name(), fmt.Sprintf("mr-out-%d", task.ID))
+    return nil
+}
+```
+
+## What MapReduce Gets Right
+
+**Separation of concerns.** The programmer writes two pure functions. The framework handles distribution, shuffling, and fault recovery. This is the right abstraction level.
+
+**Fault isolation.** Intermediate results are stored on local disk. If a network partition isolates a worker, its work is not lost — the coordinator simply re-assigns the task after a timeout.
+
+**Stragglers.** Slow workers ("stragglers") delay overall job completion. The original paper introduced **backup tasks**: when a job is near completion, the coordinator launches duplicate copies of in-progress tasks. Whichever finishes first wins. This dramatically reduces tail latency.
+
+## Where MapReduce Falls Short
+
+MapReduce is optimized for batch jobs that read all input and write all output to disk. This makes it slow for:
+
+- **Iterative algorithms** — machine learning training requires many passes over data; reading from disk each iteration kills performance
+- **Interactive queries** — a MapReduce job has substantial startup overhead (task scheduling, data loading)
+- **Real-time processing** — MapReduce operates on bounded datasets, not streams
+
+Apache Spark addressed the first two by keeping intermediate data in memory via Resilient Distributed Datasets (RDDs). Apache Flink addressed streaming. But both owe their fundamental architecture to MapReduce.
+
+## What I Took Away
+
+Building MapReduce from scratch — even a simplified version — taught me three things I wouldn't have internalized from reading alone:
+
+1. **Coordinator state is the hard part.** The actual map and reduce logic is trivial. Managing task lifecycle, timeouts, and phase transitions correctly under concurrent RPC calls is where bugs live.
+
+2. **Atomic writes matter.** Without atomic file renames, a crashed worker leaves partial files that corrupt subsequent reduce tasks. This is easy to miss until it bites you.
+
+3. **Testing with fault injection is mandatory.** A coordinator that works perfectly with reliable workers will fail silently with slow or crashing ones. You need tests that kill workers at random.
+
+The full implementation is available on [GitHub](https://github.com/shubhampanchal9900/mapreduce).

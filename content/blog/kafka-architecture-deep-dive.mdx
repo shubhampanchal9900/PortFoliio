@@ -1,0 +1,170 @@
+---
+title: "Kafka Architecture: A Deep Dive"
+description: "How Kafka achieves high throughput, fault tolerance, and exactly-once semantics — covering partitions, replication, consumer groups, and the log-based storage model."
+date: "2025-04-10"
+tags: ["Kafka", "Distributed Systems", "Backend Engineering", "Architecture"]
+---
+
+Apache Kafka is often described as a "distributed message queue," but that undersells what it actually is. Kafka is a **distributed log** — an append-only, ordered sequence of records that producers write to and consumers read from, independently, at their own pace.
+
+This distinction matters. Understanding Kafka as a log explains most of its design decisions and helps you reason about guarantees and failure modes.
+
+## The Log Abstraction
+
+A Kafka **topic** is a named log. Producers append records to the end. Consumers read by specifying an **offset** — the position in the log they want to start from.
+
+Because the log is immutable and consumers track their own position, Kafka decouples producers and consumers completely. A slow consumer doesn't back-pressure producers. Multiple consumers can read the same topic independently without interfering.
+
+Records are retained for a configurable period (e.g., 7 days), not deleted when consumed. This enables:
+
+- **Replay** — reprocess from any offset
+- **Multiple independent consumer groups**
+- **Audit trails** — the log itself is the source of truth
+
+## Partitions: The Unit of Parallelism
+
+Every topic is split into **partitions**. A partition is the actual unit of storage, replication, and parallelism.
+
+```
+Topic: payments
+  Partition 0: [msg0, msg3, msg6, ...]
+  Partition 1: [msg1, msg4, msg7, ...]
+  Partition 2: [msg2, msg5, msg8, ...]
+```
+
+Ordering is guaranteed **within a partition**, not across partitions. If you need all events for a given entity (e.g., all transactions for a user) to be ordered, route them to the same partition using a key:
+
+```java
+ProducerRecord<String, String> record = new ProducerRecord<>(
+    "payments",
+    userId,      // key — determines partition assignment
+    payload
+);
+producer.send(record);
+```
+
+Kafka hashes the key to select a partition. All records with the same key land on the same partition, in order.
+
+**Choosing partition count** is a capacity planning decision. More partitions = more parallelism = higher throughput, but also more overhead (file handles, replication traffic, election complexity). A common heuristic: start with 3–6x your expected consumer parallelism, round up to a number that divides evenly with your consumer group size.
+
+## Replication and the ISR
+
+Each partition has one **leader** and zero or more **followers** (replicas). Producers write to the leader. Followers fetch from the leader and replicate.
+
+The **In-Sync Replica (ISR)** set is the set of replicas that are fully caught up with the leader (within `replica.lag.time.max.ms`). A record is considered **committed** when all ISR members have written it to their local log.
+
+```
+Partition 0:
+  Leader:   broker-1  (offset 1000)
+  ISR:      [broker-1, broker-2, broker-3]
+  Follower: broker-2  (offset 1000) ✓ in ISR
+  Follower: broker-3  (offset 998)  ✗ lagging, removed from ISR
+```
+
+The `acks` producer setting controls durability:
+
+- `acks=0` — fire and forget, no guarantee
+- `acks=1` — leader acknowledges, followers may not have it yet
+- `acks=all` (or `-1`) — all ISR members acknowledge, maximum durability
+
+For financial or critical data, always use `acks=all` with `min.insync.replicas=2`. This ensures at least 2 replicas have the record before acknowledging the producer.
+
+```java
+props.put(ProducerConfig.ACKS_CONFIG, "all");
+props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+```
+
+## Consumer Groups
+
+A **consumer group** is a set of consumers that collaboratively consume a topic. Kafka assigns each partition to exactly one consumer in the group.
+
+```
+Topic: payments (3 partitions)
+Consumer Group: payment-processor (3 consumers)
+
+  consumer-0 → partition-0
+  consumer-1 → partition-1
+  consumer-2 → partition-2
+```
+
+If a consumer dies, Kafka **rebalances** — reassigning its partitions to other consumers in the group. Rebalances are triggered by:
+
+- Consumer joining/leaving the group
+- Consumer failing to send heartbeats within `session.timeout.ms`
+- Partition count changes
+
+Rebalances cause a pause in consumption. For high-throughput systems, tune `session.timeout.ms` and `heartbeat.interval.ms` carefully, and consider **static group membership** (`group.instance.id`) to avoid unnecessary rebalances during rolling deploys.
+
+## Exactly-Once Semantics
+
+Kafka's exactly-once delivery across producer → broker → consumer → external system requires three components working together.
+
+**Idempotent producer** — the producer retries on failure without creating duplicates:
+
+```java
+props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+```
+
+Each producer is assigned a PID (Producer ID) and sequence number. The broker deduplicates based on (PID, partition, sequence number).
+
+**Transactions** — atomically write to multiple partitions:
+
+```java
+producer.initTransactions();
+producer.beginTransaction();
+try {
+    producer.send(new ProducerRecord<>("output-topic", key, value));
+    producer.sendOffsetsToTransaction(offsets, consumerGroupMetadata);
+    producer.commitTransaction();
+} catch (Exception e) {
+    producer.abortTransaction();
+}
+```
+
+`sendOffsetsToTransaction` atomically commits the consumer offset alongside the produced records. If the transaction is aborted, both the output records and the offset commit are rolled back.
+
+**Isolation level on consumers** — consumers must only read committed transaction records:
+
+```java
+props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+```
+
+## Log Compaction
+
+For use cases where you only care about the **latest value per key** (e.g., a user's current profile, a product's current price), log compaction retains only the most recent record for each key, removing older records.
+
+```
+Before compaction:
+  offset 0: key=user-1 value={"name":"Alice","city":"Delhi"}
+  offset 1: key=user-2 value={"name":"Bob","city":"Mumbai"}
+  offset 2: key=user-1 value={"name":"Alice","city":"Pune"}   ← newer
+
+After compaction:
+  offset 1: key=user-2 value={"name":"Bob","city":"Mumbai"}
+  offset 2: key=user-1 value={"name":"Alice","city":"Pune"}
+```
+
+Enable with `cleanup.policy=compact`. Useful for building **event sourced** systems where Kafka is the source of truth and you need to reconstruct state by replaying the compacted log.
+
+## Performance Characteristics
+
+Kafka achieves high throughput through several low-level optimizations:
+
+- **Sequential I/O** — all writes are append-only, avoiding random disk seeks
+- **Zero-copy transfers** — uses `sendfile()` to transfer data from disk to network without copying through user space
+- **Batching** — producers batch records before sending; consumers fetch batches
+- **Page cache** — relies heavily on the OS page cache rather than JVM heap
+
+In practice, a single Kafka broker can sustain hundreds of MB/s of throughput on commodity hardware. For most workloads, the network is the bottleneck, not disk I/O.
+
+## Operational Notes
+
+A few things that matter in production:
+
+**Partition leadership balance** — monitor partition leadership distribution across brokers. Uneven distribution means some brokers handle disproportionate load. Use `kafka-leader-election.sh` to rebalance.
+
+**Consumer lag** — track `consumer_lag` per partition. Sustained lag means consumers can't keep up with producers. Either optimize consumer processing or scale out consumers (up to the partition count).
+
+**Retention and disk** — Kafka's retention is time-based or size-based, not consumption-based. Plan disk capacity for the full retention window at peak throughput. For 7-day retention at 100 MB/s ingest: ~60 TB per replica.
+
+**Topic configuration should be explicit** — avoid relying on auto-creation in production. Explicitly create topics with the right partition count, replication factor, and retention before deploying producers.

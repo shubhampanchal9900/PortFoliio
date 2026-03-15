@@ -1,0 +1,160 @@
+---
+title: "Raft Consensus Algorithm Explained"
+description: "A deep dive into how Raft achieves distributed consensus through leader election, log replication, and safety guarantees — with implementation notes from building a Raft-based key-value store in Go."
+date: "2025-03-01"
+tags: ["Distributed Systems", "Raft", "Consensus", "Go"]
+---
+
+Distributed consensus is one of the hardest problems in systems engineering. Getting multiple nodes to agree on a sequence of values — even when nodes crash or messages are delayed — is surprisingly subtle. Raft was designed to be more understandable than Paxos while achieving equivalent fault tolerance guarantees.
+
+This post walks through how Raft works, based on my experience implementing a Raft-based key-value store in Go.
+
+## The Core Problem
+
+Imagine you have three database replicas. A client writes a value. Which replica is authoritative? What happens if two replicas receive conflicting writes? What if one replica goes offline mid-write?
+
+Consensus algorithms solve this by ensuring all nodes agree on a single ordered log of operations. Once an entry is "committed" to this log, it's durable — all future nodes will see it.
+
+## Raft in Three Parts
+
+Raft decomposes the problem into three largely independent subproblems:
+
+1. **Leader Election** — select one node as the authoritative leader
+2. **Log Replication** — the leader accepts writes and replicates them to followers
+3. **Safety** — ensure committed entries are never lost, even across elections
+
+### Leader Election
+
+Every Raft node is in one of three states: **Follower**, **Candidate**, or **Leader**.
+
+At startup, all nodes are followers. Each follower has an **election timeout** — a random duration between 150ms and 300ms. If a follower doesn't hear from a leader within this window, it assumes the leader is dead and starts an election.
+
+```go
+type RaftNode struct {
+    mu          sync.Mutex
+    state       NodeState
+    currentTerm int
+    votedFor    int
+    log         []LogEntry
+    commitIndex int
+    lastApplied int
+    // leader-only state
+    nextIndex   []int
+    matchIndex  []int
+}
+
+func (r *RaftNode) startElection() {
+    r.mu.Lock()
+    r.state = Candidate
+    r.currentTerm++
+    r.votedFor = r.id
+    term := r.currentTerm
+    r.mu.Unlock()
+
+    votes := 1 // vote for self
+    for _, peer := range r.peers {
+        go func(peer int) {
+            granted := r.sendRequestVote(peer, term)
+            if granted {
+                atomic.AddInt32(&votes, 1)
+                if int(atomic.LoadInt32(&votes)) > len(r.peers)/2 {
+                    r.becomeLeader()
+                }
+            }
+        }(peer)
+    }
+}
+```
+
+The randomized timeout is the key insight. It makes it unlikely that two nodes start elections simultaneously, which reduces split votes.
+
+A node grants its vote if:
+- The candidate's term is at least as large as its own
+- It hasn't voted for anyone else this term
+- The candidate's log is at least as up-to-date as its own
+
+The last condition — **log completeness** — is critical for safety. A newly elected leader must have all committed entries.
+
+### Log Replication
+
+Once elected, the leader starts sending **AppendEntries** RPCs to all followers. These serve two purposes: log replication and heartbeat (keeping followers from timing out).
+
+```go
+type AppendEntriesArgs struct {
+    Term         int
+    LeaderID     int
+    PrevLogIndex int
+    PrevLogTerm  int
+    Entries      []LogEntry
+    LeaderCommit int
+}
+```
+
+The `PrevLogIndex` and `PrevLogTerm` fields implement a consistency check. A follower only accepts new entries if its log matches the leader's log up to that point. If not, the leader decrements `nextIndex` for that follower and retries — eventually finding the point of divergence.
+
+An entry is **committed** once the leader has stored it on a majority of nodes. The leader then advances `commitIndex` and notifies followers via the next AppendEntries RPC.
+
+```go
+func (r *RaftNode) maybeAdvanceCommitIndex() {
+    // Find the highest index replicated on a majority
+    for n := r.commitIndex + 1; n <= len(r.log); n++ {
+        if r.log[n-1].Term != r.currentTerm {
+            continue
+        }
+        count := 1
+        for i := range r.peers {
+            if r.matchIndex[i] >= n {
+                count++
+            }
+        }
+        if count > len(r.peers)/2 {
+            r.commitIndex = n
+        }
+    }
+}
+```
+
+Note the `r.log[n-1].Term != r.currentTerm` check. A leader never commits entries from previous terms by counting replicas — it only commits them indirectly by committing a newer entry from its own term. This prevents a subtle correctness issue described in the Raft paper (Figure 8).
+
+### Safety Guarantee
+
+Raft's core safety property: **if a log entry is committed, it will be present in the logs of all future leaders**.
+
+This is enforced through two mechanisms:
+
+1. **Election restriction** — a candidate can only win if its log is at least as up-to-date as any other node that could have voted for it
+2. **Leader completeness** — a leader never overwrites entries, only appends
+
+Together, these ensure that once an entry is committed on a majority, no future leader can be elected without that entry.
+
+## Term Numbers as a Logical Clock
+
+Terms are Raft's version of a logical clock. Every RPC carries the sender's current term. If a node sees a higher term, it immediately reverts to follower state. This ensures stale leaders can't interfere with the current term.
+
+```go
+func (r *RaftNode) maybeUpdateTerm(term int) bool {
+    if term > r.currentTerm {
+        r.currentTerm = term
+        r.state = Follower
+        r.votedFor = -1
+        return true
+    }
+    return false
+}
+```
+
+## What I Learned Building This
+
+A few things that weren't obvious from reading the paper:
+
+**Locking discipline matters enormously.** Raft has a lot of concurrent goroutines — election timer, RPC handlers, log applier. Getting the mutex scope wrong leads to subtle deadlocks or missed state transitions.
+
+**Test with unreliable networks.** My first implementation passed all basic tests but failed when the test harness introduced message delays. Partitions expose edge cases that normal operation never hits.
+
+**The commit index and apply index are different.** `commitIndex` is the highest entry known to be committed. `lastApplied` is the highest entry applied to the state machine. Applying entries in a background goroutine decouples these, which is important for performance.
+
+## Further Reading
+
+- [Raft paper — In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf)
+- [Raft visualization](https://raft.github.io/)
+- [MIT 6.824 Distributed Systems labs](https://pdos.csail.mit.edu/6.824/)
