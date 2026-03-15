@@ -49,7 +49,7 @@ export const mdxComponents = {
     return (
       <span className="block my-8">
         <Image
-          src={src}
+          src={src as string}
           alt={alt ?? ''}
           width={800}
           height={450}

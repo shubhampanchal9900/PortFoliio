@@ -98,13 +98,11 @@ export default async function BlogPost({ params }: PageProps) {
           <article className="prose prose-gray max-w-none">
             <MDXRemote
               source={post.content}
-              // @ts-expect-error – MDXComponents type mismatch is safe here
               components={mdxComponents}
               options={{
                 mdxOptions: {
                   remarkPlugins: [remarkGfm],
                   rehypePlugins: [
-                    // @ts-expect-error – rehype-pretty-code options are valid
                     [rehypePrettyCode, { theme: 'github-light', keepBackground: false }],
                     rehypeSlug,
                   ],
